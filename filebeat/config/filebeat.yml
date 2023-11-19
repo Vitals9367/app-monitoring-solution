@@ -1,0 +1,14 @@
+filebeat.inputs:
+- type: filestream
+  id: "nginx-app"
+  index: nginx-app-logs
+  enabled: true
+  paths:
+    - /logs/nginx/*.log
+
+output.logstash:
+  hosts: ["logstash:5044"]
+
+processors:
+  - add_docker_metadata:
+      host: "unix:///host_docker/docker.sock"

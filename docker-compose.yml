@@ -1,0 +1,246 @@
+version: '3.8'
+
+services:
+
+# ------- Proxy -------
+# Traefik is used to make containers accesible using hostnames
+# and also to provide SSL certificates.
+
+  traefik:
+    image: "traefik"
+    ports:
+      - "80:80"
+      - "8080:8080"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`traefik.docker.localhost`)"
+      - "traefik.http.routers.api.entrypoints=web"
+      - "traefik.http.routers.api.service=api@internal"
+      - "traefik.port=8080"
+    networks:
+      - proxy
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - ./traefik/traefik.toml:/etc/traefik/traefik.toml
+
+
+# ------- NGINX and metric exporter -------
+# Sample web application that generates logs and metrics for system to use.
+
+  nginx:
+    build:
+      context: nginx/
+    labels:
+      # Explicitly tell Traefik to expose this container
+      - "traefik.enable=true"
+      - "traefik.http.routers.nginx.rule=Host(`nginx.docker.localhost`)"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - nginx-log-data:/var/log/nginx
+    environment:
+      - PORT=4040
+    ports:
+      - "4040:4040"
+    networks:
+      - bookstore-app-net
+      - proxy
+
+  nginx_metric_exporter:
+    image: nginx/nginx-prometheus-exporter
+    labels:
+      # Explicitly tell Traefik to expose this container
+      - "traefik.enable=true"
+      - "traefik.http.routers.nginx-metric-exporter.rule=Host(`nginx-metric-exporter.docker.localhost`)"
+    ports:
+    - "9113:9113"
+    command: -nginx.scrape-uri=http://nginx:4040/stub_status
+    networks:
+      - bookstore-app-net
+      - metrics-net
+      - proxy
+    depends_on:
+      - nginx
+
+# ------- Metric collection and visualization -------
+# This is Prometheus - Grafana setup to collect and visualize metrics comming
+# from all application layers.
+
+  prometheus:
+    image: prom/prometheus
+    labels:
+      # Explicitly tell Traefik to expose this container
+      - "traefik.enable=true"
+      - "traefik.http.routers.prometheus.rule=Host(`prometheus.docker.localhost`)"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    networks:
+      - metrics-net
+      - proxy
+
+  grafana:
+    image: grafana/grafana
+    labels:
+      # Explicitly tell Traefik to expose this container
+      - "traefik.enable=true"
+      - "traefik.http.routers.grafana.rule=Host(`grafana.docker.localhost`)"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - metrics-net
+      - proxy
+    depends_on:
+      - prometheus
+
+
+# ------- Log collection and visualization -------
+# ELK setup used to collect logs using beats and visualize them using Kibana.
+
+  # The 'setup' service runs a one-off script which initializes users inside
+  # Elasticsearch — such as 'logstash_internal' and 'kibana_system' — with the
+  # values of the passwords defined in the '.env' file. It also creates the
+  # roles required by some of these users.
+  #
+  # This task only needs to be performed once, during the *initial* startup of
+  # the stack. Any subsequent run will reset the passwords of existing users to
+  # the values defined inside the '.env' file, and the built-in roles to their
+  # default permissions.
+  #
+  # By default, it is excluded from the services started by 'docker compose up'
+  # due to the non-default profile it belongs to. To run it, either provide the
+  # '--profile=setup' CLI flag to Compose commands, or "up" the service by name
+  # such as 'docker compose up setup'.
+  setup:
+    profiles:
+      - setup
+    build:
+      context: setup/
+      args:
+        ELASTIC_VERSION: ${ELASTIC_VERSION}
+    init: true
+    volumes:
+      - ./setup/entrypoint.sh:/entrypoint.sh:ro,Z
+      - ./setup/lib.sh:/lib.sh:ro,Z
+      - ./setup/roles:/roles:ro,Z
+    environment:
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-}
+      LOGSTASH_INTERNAL_PASSWORD: ${LOGSTASH_INTERNAL_PASSWORD:-}
+      KIBANA_SYSTEM_PASSWORD: ${KIBANA_SYSTEM_PASSWORD:-}
+      METRICBEAT_INTERNAL_PASSWORD: ${METRICBEAT_INTERNAL_PASSWORD:-}
+      FILEBEAT_INTERNAL_PASSWORD: ${FILEBEAT_INTERNAL_PASSWORD:-}
+      HEARTBEAT_INTERNAL_PASSWORD: ${HEARTBEAT_INTERNAL_PASSWORD:-}
+      MONITORING_INTERNAL_PASSWORD: ${MONITORING_INTERNAL_PASSWORD:-}
+      BEATS_SYSTEM_PASSWORD: ${BEATS_SYSTEM_PASSWORD:-}
+    networks:
+      - elk-net
+    depends_on:
+      - elasticsearch
+
+  elasticsearch:
+    build:
+      context: elasticsearch/
+      args:
+        ELASTIC_VERSION: ${ELASTIC_VERSION}
+    volumes:
+      - ./elasticsearch/config/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml:ro,Z
+      - elastic-data:/usr/share/elasticsearch/data:Z
+    ports:
+      - 9200:9200
+      - 9300:9300
+    environment:
+      node.name: elasticsearch
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+      # Bootstrap password.
+      # Used to initialize the keystore during the initial startup of
+      # Elasticsearch. Ignored on subsequent runs.
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:-}
+      # Use single node discovery in order to disable production mode and avoid bootstrap checks.
+      # see: https://www.elastic.co/guide/en/elasticsearch/reference/current/bootstrap-checks.html
+      discovery.type: single-node
+    networks:
+      - elk-net
+    restart: unless-stopped
+
+  kibana:
+    labels:
+      # Explicitly tell Traefik to expose this container
+      - "traefik.enable=true"
+      - "traefik.http.routers.kibana.rule=Host(`kibana.docker.localhost`)"
+    build:
+      context: kibana/
+      args:
+        ELASTIC_VERSION: ${ELASTIC_VERSION}
+    volumes:
+      - ./kibana/config/kibana.yml:/usr/share/kibana/config/kibana.yml:ro,Z
+    ports:
+      - 5601:5601
+    environment:
+      KIBANA_SYSTEM_PASSWORD: ${KIBANA_SYSTEM_PASSWORD:-}
+    networks:
+      - elk-net
+      - proxy
+    depends_on:
+      - elasticsearch
+    restart: unless-stopped
+    hostname: kibana
+
+  logstash:
+    build:
+      context: logstash/
+      args:
+        ELASTIC_VERSION: ${ELASTIC_VERSION}
+    volumes:
+      - ./logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro,Z
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro,Z
+    ports:
+      - 5044:5044
+      - 50000:50000/tcp
+      - 50000:50000/udp
+      - 9600:9600
+    environment:
+      LS_JAVA_OPTS: -Xms256m -Xmx256m
+      LOGSTASH_INTERNAL_PASSWORD: ${LOGSTASH_INTERNAL_PASSWORD:-}
+    networks:
+      - elk-net
+    depends_on:
+      - elasticsearch
+    restart: unless-stopped
+
+  filebeat:
+    build:
+      context: filebeat/
+      args:
+        ELASTIC_VERSION: ${ELASTIC_VERSION}
+    volumes:
+      - ./filebeat/config/filebeat.yml:/usr/share/filebeat/filebeat.yml
+      - nginx-log-data:/logs/nginx:ro
+    networks:
+      - elk-net
+    depends_on:
+      - logstash
+
+# ------------------------------------------
+networks:
+  metrics-net:
+    driver: bridge
+  elk-net:
+    driver: bridge
+  bookstore-app-net:
+    driver: bridge
+  proxy:
+    driver: bridge
+    name: proxy
+
+# ------------------------------------------
+volumes:
+  prometheus-data:
+  grafana-data:
+  elastic-data:
+  nginx-log-data:
